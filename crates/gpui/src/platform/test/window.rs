@@ -278,6 +278,20 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        let enabled = self
+            .0
+            .lock()
+            .platform
+            .upgrade()
+            .is_some_and(|platform| platform.a11y_enabled.get());
+        if enabled {
+            // Same path a connecting screen reader takes: the window flips to
+            // a11y-active and refreshes, so the next draw emits a real tree.
+            (callbacks.activation)();
+        }
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.lock().request_frame_callback = Some(callback);
     }

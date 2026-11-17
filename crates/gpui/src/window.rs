@@ -6053,6 +6053,21 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// Every element bounds recorded by `debug_selector` in the last rendered
+    /// frame, sorted by selector. Test-only; the read-only counterpart of
+    /// `VisualTestContext::debug_bounds` for contexts that have no lookup.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_bounds_all(&self) -> Vec<(String, Bounds<Pixels>)> {
+        let mut all: Vec<_> = self
+            .rendered_frame
+            .debug_bounds
+            .iter()
+            .map(|(selector, bounds)| (selector.clone(), *bounds))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.

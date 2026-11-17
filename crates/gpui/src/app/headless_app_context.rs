@@ -44,6 +44,7 @@ pub struct HeadlessAppContext {
     pub foreground_executor: ForegroundExecutor,
     dispatcher: TestDispatcher,
     text_system: Arc<TextSystem>,
+    platform: Rc<TestPlatform>,
 }
 
 impl HeadlessAppContext {
@@ -88,7 +89,7 @@ impl HeadlessAppContext {
 
         let text_system = Arc::new(TextSystem::new(platform_text_system));
         let http_client = http_client::FakeHttpClient::with_404_response();
-        let app = App::new_app(platform, asset_source, http_client);
+        let app = App::new_app(platform.clone(), asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::test();
 
         Self {
@@ -97,7 +98,16 @@ impl HeadlessAppContext {
             foreground_executor,
             dispatcher,
             text_system,
+            platform,
         }
+    }
+
+    /// Makes windows opened from now on activate their accessibility tree, as
+    /// if a screen reader had connected, so [`Window::debug_a11y_tree_json`]
+    /// returns a real tree after the next draw. Off by default; call before
+    /// [`HeadlessAppContext::open_window`]. Test-only.
+    pub fn set_a11y_enabled(&self, enabled: bool) {
+        self.platform.a11y_enabled.set(enabled);
     }
 
     /// Opens a window for headless rendering.

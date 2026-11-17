@@ -38,6 +38,9 @@ pub(crate) struct TestPlatform {
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
     weak: Weak<Self>,
+    /// When set, windows opened on this platform activate the a11y tree
+    /// immediately (as if a screen reader had connected). Off by default.
+    pub(crate) a11y_enabled: std::cell::Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -147,6 +150,7 @@ impl TestPlatform {
             system_notifications: Default::default(),
             text_system,
             headless_renderer_factory,
+            a11y_enabled: Default::default(),
         })
     }
 
