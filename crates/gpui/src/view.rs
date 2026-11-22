@@ -288,6 +288,7 @@ struct ViewElementState {
     /// Whether `paint_range` describes the most recent frame's paint output. A frame that
     /// prepaints this view without painting it (for example under `Visibility::Hidden`)
     /// leaves this false, because the range then points into an older frame's buffers.
+    /// A view that stays unpainted therefore renders fresh on every frame.
     painted: bool,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
@@ -482,10 +483,9 @@ impl<V: View> Element for ViewElement<V> {
                                 element.paint(window, cx);
                                 window.refreshing = refreshing;
                             } else if !window.reuse_paint(element_state.paint_range.clone()) {
-                                // Nothing was replayed. Redraw so the next frame renders this
-                                // view fresh instead of trusting its stale ranges.
+                                // Nothing was replayed. The window schedules a refresh after
+                                // this draw, so the next frame renders this view fresh.
                                 painted = false;
-                                cx.notify(entity_id);
                             }
 
                             let paint_end = window.paint_index();

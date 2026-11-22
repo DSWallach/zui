@@ -1104,6 +1104,9 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    /// Set when a frame-reuse range did not fit the previous frame. The draw that saw it
+    /// schedules a refresh so the next frame renders every view fresh.
+    pub(crate) reuse_refused: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1822,6 +1825,7 @@ impl Window {
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            reuse_refused: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2857,7 +2861,8 @@ impl Window {
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
         // resulting focus events.
-        if self.focus != focus_before_listeners {
+        let reuse_refused = mem::take(&mut self.reuse_refused);
+        if self.focus != focus_before_listeners || reuse_refused {
             self.refresh();
         }
         self.needs_present.set(true);
@@ -3291,9 +3296,18 @@ impl Window {
             range.start.deferred_draws_index,
             range.end.deferred_draws_index,
             previous.deferred_draws.len(),
-        ) && self
-            .text_system
-            .layout_range_fits(&(range.start.line_layout_index.clone()..range.end.line_layout_index.clone()))
+        ) && previous.deferred_draws
+            [range.start.deferred_draws_index..range.end.deferred_draws_index]
+            .iter()
+            .all(|deferred_draw| {
+                // `refresh_node_id` only debug-asserts that the parent is inside the
+                // reused dispatch range.
+                (range.start.dispatch_tree_index..range.end.dispatch_tree_index)
+                    .contains(&deferred_draw.parent_node.index())
+            })
+            && self.text_system.layout_range_fits(
+                &(range.start.line_layout_index.clone()..range.end.line_layout_index.clone()),
+            )
     }
 
     /// Whether every buffer `range` slices exists, in full, in the previous frame.
@@ -3333,26 +3347,22 @@ impl Window {
             .layout_range_fits(&(range.start.line_layout_index.clone()..range.end.line_layout_index.clone()))
     }
 
-    /// Reports a refused reuse. Release builds stay silent; debug builds say so once.
-    fn note_refused_reuse(what: &str) {
-        #[cfg(debug_assertions)]
-        {
-            static REPORTED: AtomicBool = AtomicBool::new(false);
-            if !REPORTED.swap(true, SeqCst) {
-                log::error!(
-                    "{what} range does not fit the previous frame; skipping reuse and painting fresh"
-                );
-            }
+    /// Records a refused reuse so the draw schedules a fresh frame, and logs the first one.
+    fn note_refused_reuse(&mut self, what: &str) {
+        self.reuse_refused = true;
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, SeqCst) {
+            log::warn!(
+                "{what} range does not fit the previous frame; skipping reuse and rendering fresh"
+            );
         }
-        #[cfg(not(debug_assertions))]
-        let _ = what;
     }
 
     /// Replays the previous frame's prepaint output for `range`. Returns false, replaying
     /// nothing, when `range` does not fit the previous frame.
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) -> bool {
         if !self.prepaint_range_fits(&range) {
-            Self::note_refused_reuse("prepaint");
+            self.note_refused_reuse("prepaint");
             return false;
         }
         self.next_frame.hitboxes.extend(
@@ -3423,7 +3433,7 @@ impl Window {
     /// nothing, when `range` does not fit the previous frame.
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) -> bool {
         if !self.paint_range_fits(&range) {
-            Self::note_refused_reuse("paint");
+            self.note_refused_reuse("paint");
             return false;
         }
         self.next_frame.presentation_callbacks.extend(
@@ -7241,9 +7251,14 @@ mod reuse_range_tests {
                 window.next_frame.accessed_element_states.len(),
             );
 
-            assert!(!window.reuse_paint(PaintIndex::default()..past_end.clone()));
-            assert!(!window.reuse_paint(reversed..PaintIndex::default()));
+            assert!(!window.reuse_refused);
             assert!(window.reuse_paint(PaintIndex::default()..PaintIndex::default()));
+            assert!(!window.reuse_refused, "a fitting range is not a refusal");
+
+            assert!(!window.reuse_paint(PaintIndex::default()..past_end.clone()));
+            assert!(window.reuse_refused, "a refusal must schedule a fresh frame");
+            window.reuse_refused = false;
+            assert!(!window.reuse_paint(reversed..PaintIndex::default()));
 
             let prepaint_past_end = PrepaintStateIndex {
                 hitboxes_index: window.rendered_frame.hitboxes.len() + 1,
