@@ -285,6 +285,10 @@ impl<V: View> IntoElement for ViewElement<V> {
 struct ViewElementState {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// Whether `paint_range` describes the most recent frame's paint output. A frame that
+    /// prepaints this view without painting it (for example under `Visibility::Hidden`)
+    /// leaves this false, because the range then points into an older frame's buffers.
+    painted: bool,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
 }
@@ -389,6 +393,9 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && element_state.painted
+                            && window.prepaint_range_fits(&element_state.prepaint_range)
+                            && window.paint_range_fits(&element_state.paint_range)
                         {
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -396,6 +403,7 @@ impl<V: View> Element for ViewElement<V> {
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.painted = false;
 
                             return (None, element_state);
                         }
@@ -423,6 +431,7 @@ impl<V: View> Element for ViewElement<V> {
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
+                                painted: false,
                                 cache_key: ViewElementCacheKey {
                                     bounds,
                                     content_mask,
@@ -466,17 +475,22 @@ impl<V: View> Element for ViewElement<V> {
                             let mut element_state = element_state.unwrap();
 
                             let paint_start = window.paint_index();
+                            let mut painted = true;
 
                             if let Some(element) = element {
                                 let refreshing = mem::replace(&mut window.refreshing, true);
                                 element.paint(window, cx);
                                 window.refreshing = refreshing;
-                            } else {
-                                window.reuse_paint(element_state.paint_range.clone());
+                            } else if !window.reuse_paint(element_state.paint_range.clone()) {
+                                // Nothing was replayed. Redraw so the next frame renders this
+                                // view fresh instead of trusting its stale ranges.
+                                painted = false;
+                                cx.notify(entity_id);
                             }
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            element_state.painted = painted;
 
                             ((), element_state)
                         },
@@ -503,5 +517,81 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement,
+        Styled, TestAppContext, Window, div, px,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    static CHILD_RENDERS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Child;
+
+    impl Render for Child {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            CHILD_RENDERS.fetch_add(1, SeqCst);
+            div().child("child text")
+        }
+    }
+
+    struct Parent {
+        child: Entity<Child>,
+        sibling: Entity<Child>,
+        invisible: bool,
+    }
+
+    impl Render for Parent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let style = StyleRefinement::default().h(px(20.0)).w(px(200.0));
+            let mut wrapper = div().child(self.child.clone().cached(style.clone()));
+            if self.invisible {
+                wrapper = wrapper.invisible();
+            }
+            div()
+                .flex()
+                .flex_col()
+                .child(self.sibling.clone().cached(style))
+                .child(wrapper)
+        }
+    }
+
+    fn draw_twice(vcx: &mut crate::VisualTestContext) {
+        vcx.update(|window, cx| window.draw(cx).clear());
+        vcx.update(|window, cx| window.draw(cx).clear());
+    }
+
+    #[crate::test]
+    fn view_prepainted_without_paint_renders_fresh_before_reuse(cx: &mut TestAppContext) {
+        let (parent, vcx) = cx.add_window_view(|_, cx| Parent {
+            child: cx.new(|_| Child),
+            sibling: cx.new(|_| Child),
+            invisible: false,
+        });
+        draw_twice(vcx);
+
+        // Prepaint without paint: the cached range now points at an older frame.
+        parent.update(vcx, |parent, cx| {
+            parent.invisible = true;
+            cx.notify();
+        });
+        draw_twice(vcx);
+        draw_twice(vcx);
+
+        parent.update(vcx, |parent, cx| {
+            parent.invisible = false;
+            cx.notify();
+        });
+        let renders_before = CHILD_RENDERS.load(SeqCst);
+        draw_twice(vcx);
+        draw_twice(vcx);
+        assert!(
+            CHILD_RENDERS.load(SeqCst) > renders_before,
+            "a view that was not painted last frame must render fresh, not replay stale ranges"
+        );
     }
 }

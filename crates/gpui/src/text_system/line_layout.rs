@@ -449,8 +449,42 @@ impl LineLayoutCache {
         }
     }
 
-    pub fn reuse_layouts(&self, range: Range<LineLayoutIndex>) {
+    /// Whether `range` lies inside the previous frame's used-layout lists.
+    pub fn layout_range_fits(&self, range: &Range<LineLayoutIndex>) -> bool {
+        Self::range_fits_previous_frame(&self.previous_frame.lock(), range)
+    }
+
+    fn range_fits_previous_frame(
+        previous_frame: &FrameCache,
+        range: &Range<LineLayoutIndex>,
+    ) -> bool {
+        let fits = |start: usize, end: usize, len: usize| start <= end && end <= len;
+        fits(
+            range.start.lines_index,
+            range.end.lines_index,
+            previous_frame.used_lines.len(),
+        ) && fits(
+            range.start.wrapped_lines_index,
+            range.end.wrapped_lines_index,
+            previous_frame.used_wrapped_lines.len(),
+        ) && fits(
+            range.start.lines_by_hash_index,
+            range.end.lines_by_hash_index,
+            previous_frame.used_lines_by_hash.len(),
+        ) && fits(
+            range.start.wrapped_lines_by_hash_index,
+            range.end.wrapped_lines_by_hash_index,
+            previous_frame.used_wrapped_lines_by_hash.len(),
+        )
+    }
+
+    /// Carries the previous frame's layouts in `range` into the current frame. Returns false,
+    /// leaving both frames untouched, when `range` does not fit the previous frame.
+    pub fn reuse_layouts(&self, range: Range<LineLayoutIndex>) -> bool {
         let mut previous_frame = &mut *self.previous_frame.lock();
+        if !Self::range_fits_previous_frame(previous_frame, &range) {
+            return false;
+        }
         let mut current_frame = &mut *self.current_frame.write();
 
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
@@ -486,6 +520,7 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines_by_hash.push(key.clone());
         }
+        true
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {

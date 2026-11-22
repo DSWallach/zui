@@ -3267,7 +3267,94 @@ impl Window {
         }
     }
 
-    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+    /// Whether every buffer `range` slices exists, in full, in the previous frame.
+    pub(crate) fn prepaint_range_fits(&self, range: &Range<PrepaintStateIndex>) -> bool {
+        let previous = &self.rendered_frame;
+        let fits = |start: usize, end: usize, len: usize| start <= end && end <= len;
+        fits(
+            range.start.hitboxes_index,
+            range.end.hitboxes_index,
+            previous.hitboxes.len(),
+        ) && fits(
+            range.start.tooltips_index,
+            range.end.tooltips_index,
+            previous.tooltip_requests.len(),
+        ) && fits(
+            range.start.accessed_element_states_index,
+            range.end.accessed_element_states_index,
+            previous.accessed_element_states.len(),
+        ) && fits(
+            range.start.dispatch_tree_index,
+            range.end.dispatch_tree_index,
+            previous.dispatch_tree.len(),
+        ) && fits(
+            range.start.deferred_draws_index,
+            range.end.deferred_draws_index,
+            previous.deferred_draws.len(),
+        ) && self
+            .text_system
+            .layout_range_fits(&(range.start.line_layout_index.clone()..range.end.line_layout_index.clone()))
+    }
+
+    /// Whether every buffer `range` slices exists, in full, in the previous frame.
+    pub(crate) fn paint_range_fits(&self, range: &Range<PaintIndex>) -> bool {
+        let previous = &self.rendered_frame;
+        let fits = |start: usize, end: usize, len: usize| start <= end && end <= len;
+        fits(
+            range.start.presentation_callbacks_index,
+            range.end.presentation_callbacks_index,
+            previous.presentation_callbacks.len(),
+        ) && fits(
+            range.start.cursor_styles_index,
+            range.end.cursor_styles_index,
+            previous.cursor_styles.len(),
+        ) && fits(
+            range.start.input_handlers_index,
+            range.end.input_handlers_index,
+            previous.input_handlers.len(),
+        ) && fits(
+            range.start.mouse_listeners_index,
+            range.end.mouse_listeners_index,
+            previous.mouse_listeners.len(),
+        ) && fits(
+            range.start.accessed_element_states_index,
+            range.end.accessed_element_states_index,
+            previous.accessed_element_states.len(),
+        ) && fits(
+            range.start.tab_handle_index,
+            range.end.tab_handle_index,
+            previous.tab_stops.insertion_history.len(),
+        ) && fits(
+            range.start.scene_index,
+            range.end.scene_index,
+            previous.scene.len(),
+        ) && self
+            .text_system
+            .layout_range_fits(&(range.start.line_layout_index.clone()..range.end.line_layout_index.clone()))
+    }
+
+    /// Reports a refused reuse. Release builds stay silent; debug builds say so once.
+    fn note_refused_reuse(what: &str) {
+        #[cfg(debug_assertions)]
+        {
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, SeqCst) {
+                log::error!(
+                    "{what} range does not fit the previous frame; skipping reuse and painting fresh"
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = what;
+    }
+
+    /// Replays the previous frame's prepaint output for `range`. Returns false, replaying
+    /// nothing, when `range` does not fit the previous frame.
+    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) -> bool {
+        if !self.prepaint_range_fits(&range) {
+            Self::note_refused_reuse("prepaint");
+            return false;
+        }
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3316,6 +3403,7 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+        true
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -3331,7 +3419,13 @@ impl Window {
         }
     }
 
-    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+    /// Replays the previous frame's paint output for `range`. Returns false, replaying
+    /// nothing, when `range` does not fit the previous frame.
+    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) -> bool {
+        if !self.paint_range_fits(&range) {
+            Self::note_refused_reuse("paint");
+            return false;
+        }
         self.next_frame.presentation_callbacks.extend(
             self.rendered_frame.presentation_callbacks
                 [range.start.presentation_callbacks_index..range.end.presentation_callbacks_index]
@@ -3373,6 +3467,7 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+        true
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -7108,5 +7203,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod reuse_range_tests {
+    use super::*;
+    use crate::{AppContext as _, TestAppContext, div};
+
+    struct Plain;
+
+    impl Render for Plain {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child("plain text")
+        }
+    }
+
+    #[crate::test]
+    fn out_of_range_reuse_is_refused_without_touching_the_next_frame(cx: &mut TestAppContext) {
+        let (_, vcx) = cx.add_window_view(|_, cx| {
+            let _ = cx;
+            Plain
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        vcx.update(|window, _| {
+            let past_end = PaintIndex {
+                accessed_element_states_index: window.rendered_frame.accessed_element_states.len() + 4,
+                ..PaintIndex::default()
+            };
+            let reversed = PaintIndex {
+                scene_index: 1,
+                ..PaintIndex::default()
+            };
+            let before = (
+                window.next_frame.scene.len(),
+                window.next_frame.accessed_element_states.len(),
+            );
+
+            assert!(!window.reuse_paint(PaintIndex::default()..past_end.clone()));
+            assert!(!window.reuse_paint(reversed..PaintIndex::default()));
+            assert!(window.reuse_paint(PaintIndex::default()..PaintIndex::default()));
+
+            let prepaint_past_end = PrepaintStateIndex {
+                hitboxes_index: window.rendered_frame.hitboxes.len() + 1,
+                ..PrepaintStateIndex::default()
+            };
+            assert!(!window.reuse_prepaint(PrepaintStateIndex::default()..prepaint_past_end));
+            assert_eq!(
+                before,
+                (
+                    window.next_frame.scene.len(),
+                    window.next_frame.accessed_element_states.len(),
+                )
+            );
+        });
     }
 }

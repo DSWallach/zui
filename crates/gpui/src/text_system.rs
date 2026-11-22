@@ -380,7 +380,11 @@ impl WindowTextSystem {
         self.line_layout_cache.layout_index()
     }
 
-    pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) {
+    pub(crate) fn layout_range_fits(&self, range: &Range<LineLayoutIndex>) -> bool {
+        self.line_layout_cache.layout_range_fits(range)
+    }
+
+    pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) -> bool {
         self.line_layout_cache.reuse_layouts(index)
     }
 
