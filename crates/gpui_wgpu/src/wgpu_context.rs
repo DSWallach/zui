@@ -29,7 +29,27 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(instance, surface, compositor_gpu, false)
+        Self::new_with_options(instance, Some(surface), compositor_gpu, false)
+    }
+
+    /// Creates a context for rendering with no window surface at all.
+    ///
+    /// The instance is Vulkan-only and has no display handle, so it never
+    /// connects to X11, Wayland or the GL/EGL stack. It uses whichever Vulkan
+    /// drivers the loader finds: restrict them with `VK_DRIVER_FILES` (for
+    /// example to lavapipe) for reproducible pixels and to keep a vendor
+    /// driver from probing the system bus. `ZED_DEVICE_ID` still selects a
+    /// specific device.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        Self::new_with_options(instance, None, None, false)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -38,13 +58,13 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(instance, surface, compositor_gpu, true)
+        Self::new_with_options(instance, Some(surface), compositor_gpu, true)
     }
 
     #[cfg(not(target_family = "wasm"))]
     fn new_with_options(
         instance: wgpu::Instance,
-        surface: &wgpu::Surface<'_>,
+        surface: Option<&wgpu::Surface<'_>>,
         compositor_gpu: Option<CompositorGpuHint>,
         reject_software: bool,
     ) -> anyhow::Result<Self> {
@@ -215,7 +235,7 @@ impl WgpuContext {
     async fn select_adapter_and_device(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
-        surface: &wgpu::Surface<'_>,
+        surface: Option<&wgpu::Surface<'_>>,
         compositor_gpu: Option<&CompositorGpuHint>,
         reject_software: bool,
     ) -> anyhow::Result<(
@@ -319,7 +339,7 @@ impl WgpuContext {
 
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
-            match Self::try_adapter_with_surface(&adapter, surface).await {
+            match Self::try_adapter(&adapter, surface).await {
                 Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
@@ -345,16 +365,23 @@ impl WgpuContext {
             }
         }
 
+        if surface.is_none() {
+            anyhow::bail!("No GPU adapter found that can create a device for offscreen rendering")
+        }
         anyhow::bail!("No GPU adapter found that can configure the display surface")
     }
 
-    /// Try to use an adapter with a surface by creating a device and testing configuration.
+    /// Try to use an adapter, with a surface by creating a device and testing configuration.
+    /// Without a surface (offscreen rendering) the adapter only has to yield a device.
     /// Returns the device and queue if successful, allowing them to be reused.
     #[cfg(not(target_family = "wasm"))]
-    async fn try_adapter_with_surface(
+    async fn try_adapter(
         adapter: &wgpu::Adapter,
-        surface: &wgpu::Surface<'_>,
+        surface: Option<&wgpu::Surface<'_>>,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+        let Some(surface) = surface else {
+            return Self::create_device(adapter).await;
+        };
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
             anyhow::bail!("no compatible surface formats");

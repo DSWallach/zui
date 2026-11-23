@@ -111,6 +111,44 @@ struct WgpuBindGroupLayouts {
     backdrop: wgpu::BindGroupLayout,
 }
 
+/// Texture an offscreen renderer draws into. It is copyable and bindable so
+/// backdrop blurs can snapshot it and the finished frame can be read back.
+fn create_offscreen_frame(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen_frame"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// The texture a frame is drawn into, and the surface image to present, if any.
+struct FrameTarget {
+    texture: wgpu::Texture,
+    surface_texture: Option<wgpu::SurfaceTexture>,
+}
+
+impl FrameTarget {
+    fn present(self) {
+        if let Some(surface_texture) = self.surface_texture {
+            surface_texture.present();
+        }
+    }
+}
+
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
@@ -176,7 +214,10 @@ const BACKDROP_MAX_BLURS: usize = 32;
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    /// The window surface, or `None` for an offscreen renderer, which draws
+    /// into `offscreen_frame` instead.
+    surface: Option<wgpu::Surface<'static>>,
+    offscreen_frame: Option<wgpu::Texture>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -197,6 +238,17 @@ struct WgpuResources {
 }
 
 impl WgpuResources {
+    /// Applies `config` to the window surface, or recreates the offscreen
+    /// frame texture at its size.
+    fn configure_target(&mut self, config: &wgpu::SurfaceConfiguration) {
+        match &self.surface {
+            Some(surface) => surface.configure(&self.device, config),
+            None => {
+                self.offscreen_frame = Some(create_offscreen_frame(&self.device, config));
+            }
+        }
+    }
+
     fn invalidate_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
@@ -319,7 +371,7 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
-            surface,
+            Some(surface),
             config,
             compositor_gpu,
             atlas,
@@ -339,18 +391,53 @@ impl WgpuRenderer {
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
 
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, Some(surface), config, None, atlas)
+    }
+
+    /// Creates a renderer that draws into an offscreen texture instead of a
+    /// window surface. It never touches a window system; read the finished
+    /// frame with [`read_offscreen_frame`](Self::read_offscreen_frame).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen(
+        context: &WgpuContext,
+        config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<Self> {
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+        Self::new_offscreen_with_atlas(context, config, atlas)
+    }
+
+    /// [`new_offscreen`](Self::new_offscreen) drawing with an existing sprite atlas, for
+    /// callers that must hand the atlas out before the first frame.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen_with_atlas(
+        context: &WgpuContext,
+        config: WgpuSurfaceConfig,
+        atlas: Arc<WgpuAtlas>,
+    ) -> anyhow::Result<Self> {
+        Self::new_internal(None, context, None, config, None, atlas)
     }
 
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
-        surface: wgpu::Surface<'static>,
+        surface: Option<wgpu::Surface<'static>>,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let surface_caps = surface.get_capabilities(&context.adapter);
+        let surface_caps = match &surface {
+            Some(surface) => surface.get_capabilities(&context.adapter),
+            // An offscreen frame is any texture we create ourselves.
+            None => wgpu::SurfaceCapabilities {
+                formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+                present_modes: vec![wgpu::PresentMode::Fifo],
+                // Opaque only: readback assumes straight alpha forced to 255.
+                alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+                usages: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+            },
+        };
         let preferred_formats = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -439,7 +526,13 @@ impl WgpuRenderer {
         };
         // Configure the surface immediately. The adapter selection process already validated
         // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
+        let offscreen_frame = match &surface {
+            Some(surface) => {
+                surface.configure(&context.device, &surface_config);
+                None
+            }
+            None => Some(create_offscreen_frame(&context.device, &surface_config)),
+        };
 
         let queue = Arc::clone(&context.queue);
         let dual_source_blending = context.supports_dual_source_blending();
@@ -569,6 +662,7 @@ impl WgpuRenderer {
             device,
             queue,
             surface,
+            offscreen_frame,
             pipelines,
             bind_group_layouts,
             atlas_sampler,
@@ -1205,9 +1299,7 @@ impl WgpuRenderer {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            resources.configure_target(&surface_config);
 
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
@@ -1639,9 +1731,7 @@ impl WgpuRenderer {
             let Some(resources) = self.resources.as_mut() else {
                 return;
             };
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            resources.configure_target(&surface_config);
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1730,33 +1820,48 @@ impl WgpuRenderer {
             self.blur_free_frames = 0;
         }
 
-        let frame = match self.resources().surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
+        let frame = if self.resources().surface.is_none() {
+            let texture = self
+                .resources()
+                .offscreen_frame
+                .clone()
+                .expect("offscreen frame texture");
+            FrameTarget {
+                texture,
+                surface_texture: None,
             }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                *self.last_error.lock().unwrap() =
-                    Some("Surface texture validation error".to_string());
-                return false;
+        } else {
+            let acquired = self
+                .resources()
+                .surface
+                .as_ref()
+                .expect("surface")
+                .get_current_texture();
+            match acquired {
+                wgpu::CurrentSurfaceTexture::Success(frame) => FrameTarget {
+                    texture: frame.texture.clone(),
+                    surface_texture: Some(frame),
+                },
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    // Textures must be destroyed before the surface can be reconfigured.
+                    drop(frame);
+                    let surface_config = self.surface_config.clone();
+                    self.resources_mut().configure_target(&surface_config);
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    let surface_config = self.surface_config.clone();
+                    self.resources_mut().configure_target(&surface_config);
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    *self.last_error.lock().unwrap() =
+                        Some("Surface texture validation error".to_string());
+                    return false;
+                }
             }
         };
 
@@ -2504,6 +2609,12 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         instance: &wgpu::Instance,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.resources
+                .as_ref()
+                .is_none_or(|resources| resources.surface.is_some()),
+            "an offscreen renderer has no window surface to replace"
+        );
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
@@ -2532,7 +2643,8 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.surface = Some(surface);
+            res.offscreen_frame = None;
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -2541,6 +2653,91 @@ impl WgpuRenderer {
         self.surface_configured = true;
 
         Ok(())
+    }
+
+    /// Copies the last frame an offscreen renderer drew back to the CPU as
+    /// tightly packed `Bgra8Unorm` rows, waiting for the GPU to finish first.
+    ///
+    /// For an opaque target the alpha channel is forced to 255, matching a
+    /// window whose contents are composited over nothing.
+    pub fn read_offscreen_frame(&mut self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let opaque = self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::Opaque;
+        debug_assert_eq!(
+            self.surface_config.format,
+            wgpu::TextureFormat::Bgra8Unorm,
+            "callers convert the readback assuming BGRA"
+        );
+        let resources = self.resources();
+        let texture = resources
+            .offscreen_frame
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("renderer has no offscreen frame to read"))?;
+        let unpadded_row = width as usize * 4;
+        let padded_row = unpadded_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let readback = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen_readback"),
+            size: (padded_row * height as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = resources
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("offscreen_readback_encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        resources.queue.submit(std::iter::once(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        resources
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                // Generous, but a wedged driver should fail the preview, not hang it.
+                timeout: Some(std::time::Duration::from_secs(60)),
+            })
+            .map_err(|error| anyhow::anyhow!("failed to wait for the offscreen frame: {error:?}"))?;
+        // A validation error in the frame just drawn is only recorded by the uncaptured-error
+        // handler; `draw` would not look until the next frame.
+        if let Some(error) = self.last_error.lock().unwrap().take() {
+            anyhow::bail!("GPU error while rendering the offscreen frame: {error}");
+        }
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("offscreen readback was dropped"))?
+            .map_err(|error| anyhow::anyhow!("failed to map the offscreen frame: {error}"))?;
+        let mapped = readback.slice(..).get_mapped_range();
+        let mut pixels = Vec::with_capacity(unpadded_row * height as usize);
+        for row in mapped.chunks_exact(padded_row) {
+            pixels.extend_from_slice(&row[..unpadded_row]);
+        }
+        drop(mapped);
+        readback.unmap();
+        if opaque {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+        Ok((width, height, pixels))
     }
 
     pub fn destroy(&mut self) {
@@ -2572,7 +2769,10 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
+        let gpu_context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("an offscreen renderer has no window to recover"))?;
 
         // Check if another window already recovered the context
         let needs_new_context = gpu_context
@@ -2627,7 +2827,7 @@ impl WgpuRenderer {
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            surface,
+            Some(surface),
             config,
             self.compositor_gpu,
             self.atlas.clone(),

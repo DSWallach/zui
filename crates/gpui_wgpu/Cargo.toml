@@ -14,6 +14,8 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
+# Offscreen rendering: `WgpuHeadlessRenderer` implements `gpui::PlatformHeadlessRenderer`.
+test-support = ["gpui/test-support", "dep:image"]
 
 [dependencies]
 gpui.workspace = true
@@ -31,6 +33,7 @@ smallvec.workspace = true
 swash = "0.2.6"
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
+image = { workspace = true, optional = true }
 wgpu.workspace = true
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)

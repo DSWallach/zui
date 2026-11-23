@@ -69,7 +69,22 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
         ))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        // Offscreen Vulkan: no window, compositor or display connection. Without
+        // a usable adapter the caller sees `None` and reports it.
+        match gpui_wgpu::WgpuHeadlessRenderer::new() {
+            Ok(renderer) => Some(Box::new(renderer)),
+            Err(error) => {
+                // Not `log`: preview and test processes install no logger, and without this
+                // line the caller only sees "no HeadlessRenderer configured".
+                eprintln!("offscreen renderer unavailable: {error:#}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     {
         None
     }
